@@ -1,0 +1,707 @@
+import {
+    getPopupTarget,
+    initPopupsConfigurationMain,
+    setupPictureInPictureMain,
+    setupPowerMonitorMain,
+    setupRemoteControlMain,
+    setupScreenSharingMain
+} from '@jitsi/electron-sdk/main';
+import {
+    BrowserWindow,
+    Menu,
+    app,
+    dialog,
+    ipcMain
+} from 'electron';
+import contextMenu from 'electron-context-menu';
+import debug from 'electron-debug';
+import isDev from 'electron-is-dev';
+import log from 'electron-log';
+import electronReload from 'electron-reload';
+import { autoUpdater } from 'electron-updater';
+import windowStateKeeper from 'electron-window-state';
+import * as path from 'path';
+import * as URL from 'url';
+
+import config from './app/features/config';
+import { openExternalLink } from './app/features/utils/openExternalLink';
+import { t } from './app/i18n/main';
+import pkgJson from './package.json';
+
+// This file is bundled to ./build/main.js, so under esbuild __dirname is the
+// build/ directory and its parent is the application root holding build/ and
+// resources/ (in both development and the packaged app). Do not use __dirname
+// directly for app paths: the previous webpack build neutralised __dirname via
+// `node: { __dirname: true }`, so this indirection replaces that behaviour.
+const rootDir = path.resolve(__dirname, '..');
+
+const showDevTools = Boolean(process.env.SHOW_DEV_TOOLS) || (process.argv.indexOf('--show-dev-tools') > -1);
+
+/**
+ * Parse --defaultServer CLI argument (supports both --defaultServer=URL and --defaultServer URL).
+ * In dev mode via `npm start`, arguments passed via `npm start -- --defaultServer` are consumed
+ * by `concurrently` and never reach the Electron process. Use the JITSI_DEFAULT_SERVER
+ * environment variable for dev mode instead (mirrors the SHOW_DEV_TOOLS pattern).
+ * Dev usage: $env:JITSI_DEFAULT_SERVER='https://example.com'; npm start
+ */
+const defaultServerArgIdx = process.argv.findIndex(arg => arg.startsWith('--defaultServer'));
+let defaultServerURL: string | null = process.env.JITSI_DEFAULT_SERVER || null;
+
+if (defaultServerArgIdx > -1) {
+    const arg = process.argv[defaultServerArgIdx];
+
+    if (arg.includes('=')) {
+        defaultServerURL = arg.split('=')[1] || null;
+    } else if (process.argv[defaultServerArgIdx + 1] && !process.argv[defaultServerArgIdx + 1].startsWith('--')) {
+        defaultServerURL = process.argv[defaultServerArgIdx + 1];
+    }
+}
+
+// Fix screen-sharing thumbnails being missing sometimes.
+// https://github.com/electron/electron/issues/44504
+const disabledFeatures = [
+    'ThumbnailCapturerMac:capture_mode/sc_screenshot_manager',
+    'ScreenCaptureKitPickerScreen',
+    'ScreenCaptureKitStreamPickerSonoma'
+];
+
+app.commandLine.appendSwitch('disable-features', disabledFeatures.join(','));
+
+// Enable Opus RED field trial.
+app.commandLine.appendSwitch('force-fieldtrials', 'WebRTC-Audio-Red-For-Opus/Enabled/');
+
+// Wayland: Enable optional PipeWire support.
+if (!app.commandLine.hasSwitch('enable-features')) {
+    app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+}
+
+autoUpdater.logger = log;
+log.transports.file.level = 'info';
+
+// Enable context menu so things like copy and paste work in input fields.
+contextMenu({
+    showLookUpSelection: false,
+    showSearchWithGoogle: false,
+    showCopyImage: false,
+    showCopyImageAddress: false,
+    showSaveImage: false,
+    showSaveImageAs: false,
+    showInspectElement: true,
+    showServices: false
+});
+
+// Enable DevTools also on release builds to help troubleshoot issues. Don't
+// show them automatically though.
+debug({
+    isEnabled: true,
+    showDevTools
+});
+
+/**
+ * When in development mode:
+ * - Enable automatic reloads
+ */
+if (isDev) {
+    electronReload(path.join(rootDir, 'build'));
+}
+
+/**
+ * The window object that will load the iframe with Jitsi Meet.
+ * IMPORTANT: Must be defined as global in order to not be garbage collected
+ * acidentally.
+ */
+let mainWindow: BrowserWindow | null = null;
+
+/**
+ * Window 2: Meeting window — created on demand, full size.
+ * IMPORTANT: Must be defined as global to avoid garbage collection.
+ */
+let meetingWindow: BrowserWindow | null = null;
+
+
+let webrtcInternalsWindow: BrowserWindow | null = null;
+
+/**
+ * Add protocol data
+ */
+const appProtocolSurplus = `${config.appProtocolPrefix}://`;
+let rendererReady = false;
+let protocolDataForFrontApp: string | null = null;
+
+/**
+ * Whether the automatic update check already ran in this app run. The
+ * launcher window can be recreated, so this must not run on every creation.
+ */
+let updateCheckStarted = false;
+
+
+/**
+ * Sets the application menu. It is hidden on all platforms except macOS because
+ * otherwise copy and paste functionality is not available.
+ */
+function setApplicationMenu() {
+    if (process.platform === 'darwin') {
+        const template: Electron.MenuItemConstructorOptions[] = [ {
+            label: app.name,
+            submenu: [
+                {
+                    role: 'services',
+                    submenu: []
+                },
+                { type: 'separator' },
+                { role: 'hide' },
+                // NOTE: kept as the original (lowercase) role string to preserve
+                // behaviour; the typed role union only knows 'hideOthers'.
+                { role: 'hideothers' } as unknown as Electron.MenuItemConstructorOptions,
+                { role: 'unhide' },
+                { type: 'separator' },
+                { role: 'quit' }
+            ]
+        }, {
+            label: 'Edit',
+            submenu: [
+                {
+                    label: 'Undo',
+                    accelerator: 'CmdOrCtrl+Z',
+                    selector: 'undo:'
+                } as Electron.MenuItemConstructorOptions,
+                {
+                    label: 'Redo',
+                    accelerator: 'Shift+CmdOrCtrl+Z',
+                    selector: 'redo:'
+                } as Electron.MenuItemConstructorOptions,
+                {
+                    type: 'separator'
+                },
+                {
+                    label: 'Cut',
+                    accelerator: 'CmdOrCtrl+X',
+                    selector: 'cut:'
+                } as Electron.MenuItemConstructorOptions,
+                {
+                    label: 'Copy',
+                    accelerator: 'CmdOrCtrl+C',
+                    selector: 'copy:'
+                } as Electron.MenuItemConstructorOptions,
+                {
+                    label: 'Paste',
+                    accelerator: 'CmdOrCtrl+V',
+                    selector: 'paste:'
+                } as Electron.MenuItemConstructorOptions,
+                {
+                    label: 'Select All',
+                    accelerator: 'CmdOrCtrl+A',
+                    selector: 'selectAll:'
+                } as Electron.MenuItemConstructorOptions
+            ]
+        }, {
+            label: '&Window',
+            role: 'window',
+            submenu: [
+                { role: 'minimize' },
+                { role: 'close' }
+            ]
+        } ];
+
+        Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+    } else {
+        Menu.setApplicationMenu(null);
+    }
+}
+
+/**
+ * Opens new window with index.html(Jitsi Meet is loaded in iframe there).
+ */
+function createJitsiMeetWindow() {
+    // The launcher window can be recreated (close + relaunch re-attaches to the
+    // running process), so the renderer readiness flag must be per-window.
+    rendererReady = false;
+
+    // Application menu.
+    setApplicationMenu();
+
+    // Check for Updates. Once per app run: the launcher window can be recreated.
+    if (!process.mas && !updateCheckStarted) {
+        updateCheckStarted = true;
+        autoUpdater.checkForUpdatesAndNotify();
+    }
+
+    // Load the previous window state with fallback to defaults.
+    const windowState = windowStateKeeper({
+        defaultHeight: 600,
+        fullScreen: false
+    });
+
+    // Path to root directory.
+    const basePath = isDev ? rootDir : app.getAppPath();
+
+    // URL for index.html which will be our entry point.
+    const indexURL = URL.format({
+        pathname: path.resolve(basePath, './build/index.html'),
+        protocol: 'file:',
+        slashes: true
+    });
+
+    // Options used when creating the main Jitsi Meet window.
+    // Use a preload script in order to provide node specific functionality
+    // to a isolated BrowserWindow in accordance with electron security
+    // guideline.
+    const options: Electron.BrowserWindowConstructorOptions = {
+        x: windowState.x,
+        y: windowState.y,
+        width: 480,
+        height: windowState.height,
+        icon: path.resolve(basePath, './resources/icon.png'),
+        minWidth: 480,
+        minHeight: 600,
+        show: false,
+        webPreferences: {
+            enableBlinkFeatures: 'WebAssemblyCSP',
+            contextIsolation: true,
+            nodeIntegration: false,
+            preload: path.resolve(basePath, './build/preload.js'),
+            sandbox: true
+        }
+    };
+
+    mainWindow = new BrowserWindow(options);
+    windowState.manage(mainWindow);
+    mainWindow.loadURL(indexURL);
+
+    if (isDev) {
+        mainWindow.webContents.session.clearCache();
+    }
+
+    // Block access to file:// URLs.
+    const fileFilter = {
+        urls: [ 'file://*' ]
+    };
+
+    mainWindow.webContents.session.webRequest.onBeforeSendHeaders(fileFilter, (details, callback) => {
+        const requestedPath = path.resolve(URL.fileURLToPath(details.url));
+        const appBasePath = path.resolve(basePath);
+
+        if (!requestedPath.startsWith(appBasePath)) {
+            callback({ cancel: true });
+            console.warn(`Rejected file URL: ${details.url}`);
+
+            return;
+        }
+
+        callback({ cancel: false });
+    });
+
+    // Filter out x-frame-options and frame-ancestors CSP to allow loading jitsi via the iframe API
+    // Resolves https://github.com/jitsi/jitsi-meet-electron/issues/285
+    mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
+        const responseHeaders = details.responseHeaders ?? {};
+
+        delete responseHeaders['x-frame-options'];
+
+        if (responseHeaders['content-security-policy']) {
+            const cspFiltered = responseHeaders['content-security-policy'][0]
+                .split(';')
+                .filter(x => x.indexOf('frame-ancestors') === -1)
+                .join(';');
+
+            responseHeaders['content-security-policy'] = [ cspFiltered ];
+        }
+
+        if (responseHeaders['Content-Security-Policy']) {
+            const cspFiltered = responseHeaders['Content-Security-Policy'][0]
+                .split(';')
+                .filter(x => x.indexOf('frame-ancestors') === -1)
+                .join(';');
+
+            responseHeaders['Content-Security-Policy'] = [ cspFiltered ];
+        }
+
+        callback({
+            responseHeaders
+        });
+    });
+
+    // Block redirects.
+    const allowedRedirects = [
+        'http:',
+        'https:',
+        'ws:',
+        'wss:'
+    ];
+
+    mainWindow.webContents.addListener('will-redirect', (ev, url) => {
+        const requestedUrl = new URL.URL(url);
+
+        if (!allowedRedirects.includes(requestedUrl.protocol)) {
+            console.warn(`Disallowing redirect to ${url}`);
+            ev.preventDefault();
+        }
+    });
+
+    // Block opening any external applications.
+    mainWindow.webContents.session.setPermissionRequestHandler((_, permission, callback, details) => {
+        if (permission === 'openExternal') {
+            console.warn(`Disallowing opening ${(details as { externalURL?: string; }).externalURL}`);
+            callback(false);
+
+            return;
+        }
+
+        callback(true);
+    });
+
+    // NOTE: Popups configuration and SDK handlers are set up on the
+    // meetingWindow (not the launcher) because the conference iframe
+    // only exists there. See the 'open-meeting-window' handler below.
+
+    mainWindow.on('closed', () => {
+        mainWindow = null;
+    });
+    mainWindow.once('ready-to-show', () => {
+        mainWindow?.show();
+    });
+}
+
+/**
+ * Brings the launcher window to the foreground, recreating it when it was
+ * closed. Running meeting windows are never touched.
+ *
+ * @returns {void}
+ */
+function showLauncherWindow() {
+    if (mainWindow === null) {
+        createJitsiMeetWindow();
+
+        return;
+    }
+
+    if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+    }
+
+    mainWindow.show();
+    mainWindow.focus();
+}
+
+/**
+ * Opens new window with WebRTC internals.
+ */
+function createWebRTCInternalsWindow() {
+    const options = {
+        minWidth: 800,
+        minHeight: 600,
+        show: true
+    };
+
+    webrtcInternalsWindow = new BrowserWindow(options);
+    webrtcInternalsWindow.loadURL('chrome://webrtc-internals');
+}
+
+/**
+ * Handler for application protocol links to initiate a conference.
+ *
+ * @param {string} fullProtocolCall - The protocol call (e.g. jitsi-meet://test).
+ * @returns {void}
+ */
+function handleProtocolCall(fullProtocolCall?: string) {
+    // don't touch when something is bad
+    if (
+        !fullProtocolCall
+        || fullProtocolCall.trim() === ''
+        || fullProtocolCall.indexOf(appProtocolSurplus) !== 0
+    ) {
+        return;
+    }
+
+    const inputURL = fullProtocolCall.replace(appProtocolSurplus, '');
+
+    if (meetingWindow) {
+        meetingWindow.webContents.send('protocol-data-msg', inputURL);
+
+        return;
+    }
+
+    if (app.isReady() && mainWindow === null) {
+        createJitsiMeetWindow();
+    }
+
+    protocolDataForFrontApp = inputURL;
+
+    if (rendererReady && mainWindow) {
+        mainWindow
+            .webContents
+            .send('protocol-data-msg', inputURL);
+        protocolDataForFrontApp = null;
+    }
+}
+
+/**
+ * Force Single Instance Application.
+ * On MAS the lock below does not work; single-instancing is handled there via
+ * LSMultipleInstancesProhibited in Info.plist.
+ */
+const gotInstanceLock = process.mas ? true : app.requestSingleInstanceLock();
+
+if (!gotInstanceLock) {
+    app.quit();
+    process.exit(0);
+}
+
+/**
+ * Run the application.
+ */
+
+app.on('activate', () => {
+    showLauncherWindow();
+});
+
+app.on('certificate-error',
+    // eslint-disable-next-line max-params
+    (event, webContents, url, error, certificate, callback) => {
+        if (isDev) {
+            event.preventDefault();
+            callback(true);
+        } else {
+            callback(false);
+        }
+    }
+);
+
+app.on('ready', () => {
+    createJitsiMeetWindow();
+
+    /**
+     * When someone tries to enter something like jitsi-meet://test
+     * while app is closed it arrives as a command line argument.
+     * Dispatched once and without mutating process.argv: switches may
+     * follow the URL.
+     */
+    const protocolArg = process.argv.find(arg => arg.startsWith(appProtocolSurplus));
+
+    if (protocolArg) {
+        handleProtocolCall(protocolArg);
+    }
+});
+
+if (isDev) {
+    app.on('ready', createWebRTCInternalsWindow);
+}
+
+app.on('second-instance', (event, commandLine) => {
+    /**
+     * If someone launches the application again, bring the launcher window
+     * back into focus - recreating it if it was closed - without touching
+     * running meetings.
+     */
+    showLauncherWindow();
+
+    /**
+     * This is for windows [win32]
+     * so when someone tries to enter something like jitsi-meet://test
+     * while app is opened it will trigger protocol handler.
+     * Select the URL without mutating commandLine: switches may follow it.
+     */
+    const protocolArg = commandLine.find(arg => arg.startsWith(appProtocolSurplus));
+
+    if (protocolArg) {
+        handleProtocolCall(protocolArg);
+    }
+});
+
+app.on('window-all-closed', () => {
+    app.quit();
+});
+
+// remove so we can register each time as we run the app.
+app.removeAsDefaultProtocolClient(config.appProtocolPrefix);
+
+// If we are running a non-packaged version of the app && on windows
+if (isDev && process.platform === 'win32') {
+    // Set the path of electron.exe and your app.
+    // These two additional parameters are only available on windows.
+    app.setAsDefaultProtocolClient(
+        config.appProtocolPrefix,
+        process.execPath,
+        [ path.resolve(process.argv[1]) ]
+    );
+} else {
+    app.setAsDefaultProtocolClient(config.appProtocolPrefix);
+}
+
+/**
+ * This is for mac [darwin]
+ * so when someone tries to enter something like jitsi-meet://test
+ * it will trigger this event below
+ */
+app.on('open-url', (event, data) => {
+    event.preventDefault();
+    handleProtocolCall(data);
+});
+
+/**
+ * This is to notify main.js [this] that front app is ready to receive messages.
+ * Called by BOTH the launcher and the meeting window on componentDidMount.
+ */
+ipcMain.on('renderer-ready', event => {
+    // Launcher window — existing behaviour unchanged.
+    if (mainWindow && event.sender.id === mainWindow.webContents.id) {
+        rendererReady = true;
+        if (protocolDataForFrontApp) {
+            mainWindow
+                .webContents
+                .send('protocol-data-msg', protocolDataForFrontApp);
+            protocolDataForFrontApp = null;
+        }
+
+        if (defaultServerURL) {
+            mainWindow.webContents.send('set-default-server', defaultServerURL);
+        }
+    }
+
+    // Meeting window is ready.
+});
+
+/**
+ * Handle opening external links in the main process.
+ */
+ipcMain.on('jitsi-open-url', (event, someUrl) => {
+    openExternalLink(someUrl);
+});
+
+/**
+ * Restore the meeting window (e.g. from PiP).
+ */
+ipcMain.on('restore-meeting-window', () => {
+    if (meetingWindow) {
+        if (meetingWindow.isMinimized()) {
+            meetingWindow.restore();
+        }
+        meetingWindow.focus();
+    }
+});
+
+/**
+ * Asks the user whether a remote control session may start.
+ *
+ * The request that gets here reaches the meeting window as a postMessage from
+ * the conference iframe, so it carries no identity that can be trusted: any page
+ * loaded in that iframe can send it, and Jitsi Meet's own in-page consent UI
+ * runs inside exactly the frame an attacker controls. The prompt is therefore a
+ * native, modal dialog owned by the main process — web content can neither
+ * render, click nor dismiss it — and nothing is executed until the user allows
+ * it here.
+ *
+ * @returns {Promise<boolean>} Whether the user allowed the session.
+ */
+async function requestRemoteControlConsent(): Promise<boolean> {
+    if (!meetingWindow) {
+        return false;
+    }
+
+    const { response } = await dialog.showMessageBox(meetingWindow, {
+        type: 'warning',
+        buttons: [ t('remoteControl.deny'), t('remoteControl.allow') ],
+        defaultId: 0,
+        cancelId: 0,
+        message: t('remoteControl.message'),
+        detail: t('remoteControl.detail')
+    });
+
+    return response === 1;
+}
+
+/**
+ * Open the meeting in Window 2.
+ * If a meeting window already exists, focus it and navigate to the new conference.
+ * Otherwise create a new one.
+ */
+ipcMain.on('open-meeting-window', (event, conference) => {
+    if (meetingWindow) {
+        meetingWindow.focus();
+        meetingWindow.webContents.send('navigate-to-conference', conference);
+
+        return;
+    }
+
+    const basePath = isDev ? rootDir : app.getAppPath();
+    const meetingURL = URL.format({
+        pathname: path.resolve(basePath, './build/meeting.html'),
+        protocol: 'file:',
+        slashes: true
+    });
+
+    const windowOpenHandler = ({ url, frameName }: { frameName: string; url: string; }) => {
+        const target = getPopupTarget(url, frameName);
+
+        if (!target || target === 'browser') {
+            openExternalLink(url);
+
+            return { action: 'deny' };
+        }
+
+        if (target === 'electron') {
+            return { action: 'allow' };
+        }
+
+        return { action: 'deny' };
+    };
+
+    meetingWindow = new BrowserWindow({
+        width: 1200,
+        height: 800,
+        minWidth: 800,
+        minHeight: 600,
+        icon: path.resolve(basePath, './resources/icon.png'),
+        resizable: true,
+        show: false,
+        webPreferences: {
+            enableBlinkFeatures: 'WebAssemblyCSP',
+            contextIsolation: true,
+            nodeIntegration: false,
+            preload: path.resolve(basePath, './build/preload.js'),
+            sandbox: true
+        }
+    });
+
+    meetingWindow.loadURL(meetingURL);
+
+    meetingWindow.webContents.once('did-finish-load', () => {
+        meetingWindow?.webContents.send('navigate-to-conference', conference);
+    });
+
+    // SDK setup — these need the window that hosts the conference iframe.
+    initPopupsConfigurationMain(meetingWindow, windowOpenHandler);
+    setupPictureInPictureMain(meetingWindow);
+    setupPowerMonitorMain(meetingWindow);
+    setupScreenSharingMain(meetingWindow, config.appName, pkgJson.build.appId);
+    setupRemoteControlMain(meetingWindow, { requestConsent: requestRemoteControlConsent });
+
+    // Block redirects — same protection as the launcher window.
+    meetingWindow.webContents.addListener('will-redirect', (ev, url) => {
+        const allowedProtocols = [ 'http:', 'https:', 'ws:', 'wss:' ];
+        const requestedUrl = new URL.URL(url);
+
+        if (!allowedProtocols.includes(requestedUrl.protocol)) {
+            console.warn(`Disallowing redirect to ${url}`);
+            ev.preventDefault();
+        }
+    });
+
+    // Closing the meeting window must NOT quit the app — launcher stays open.
+    meetingWindow.on('closed', () => {
+        meetingWindow = null;
+    });
+
+    meetingWindow.once('ready-to-show', () => {
+        meetingWindow?.show();
+    });
+});
+
+/**
+ * Close the meeting window — called by renderer when End Call is clicked.
+ */
+ipcMain.on('close-meeting-window', () => {
+    if (meetingWindow) {
+        meetingWindow.close();
+    }
+});
